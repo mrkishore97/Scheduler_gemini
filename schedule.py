@@ -11,8 +11,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CHANGE 1: IMPROVED CSS FOR VISIBILITY ---
-# Added specific styling for text, headers, and metrics to ensure they appear dark on the white background.
+# Apply light theme styling with proper text colors
 st.markdown("""
     <style>
     .main {
@@ -21,20 +20,32 @@ st.markdown("""
     .stApp {
         background-color: #ffffff;
     }
-    /* Force text colors to dark grey/black for visibility */
-    h1, h2, h3, h4, h5, h6, p, span, li, div {
-        color: #31333F !important;
+    /* Fix text visibility */
+    .stMarkdown, .stText, p, span, div {
+        color: #1f1f1f !important;
     }
-    /* Specific styling for Metrics to ensure they are visible */
-    [data-testid="stMetricValue"] {
-        color: #31333F !important;
+    /* Fix selectbox and dropdown colors */
+    .stSelectbox label, .stMultiSelect label {
+        color: #1f1f1f !important;
     }
-    [data-testid="stMetricLabel"] {
-        color: #555555 !important;
+    /* Fix metric labels and values */
+    .stMetric label {
+        color: #1f1f1f !important;
     }
-    /* Fix table text color */
-    div[data-testid="stDataFrame"] {
-        color: #31333F !important;
+    .stMetric .metric-value {
+        color: #1f1f1f !important;
+    }
+    /* Fix input labels */
+    .stTextInput label, .stDateInput label {
+        color: #1f1f1f !important;
+    }
+    /* Fix tab text */
+    .stTabs [data-baseweb="tab"] {
+        color: #1f1f1f !important;
+    }
+    /* Fix info box text */
+    .stAlert {
+        color: #1f1f1f !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -44,10 +55,10 @@ if 'df' not in st.session_state:
     st.session_state.df = None
 if 'last_saved' not in st.session_state:
     st.session_state.last_saved = None
-# --- CHANGE 2: DATA VERSION CONTROL ---
-# This counter helps force the table to refresh when the calendar updates the data
-if 'data_version' not in st.session_state:
-    st.session_state.data_version = 0
+if 'pending_calendar_changes' not in st.session_state:
+    st.session_state.pending_calendar_changes = []
+if 'pending_table_changes' not in st.session_state:
+    st.session_state.pending_table_changes = False
 
 # Color mapping for statuses
 STATUS_COLORS = {
@@ -167,7 +178,6 @@ def generate_pdf_schedule(df, year, month):
                 font-family: Arial, sans-serif;
                 padding: 20px;
                 background: white;
-                color: black;
             }}
             h1 {{
                 color: #333;
@@ -190,7 +200,6 @@ def generate_pdf_schedule(df, year, month):
             td {{
                 padding: 10px;
                 border-bottom: 1px solid #ddd;
-                color: black;
             }}
             tr:nth-child(even) {{
                 background-color: #f8f9fa;
@@ -274,7 +283,6 @@ with st.sidebar:
     if uploaded_file is not None:
         if st.button("Load Data", type="primary"):
             st.session_state.df = load_data(uploaded_file)
-            st.session_state.data_version += 1 # Reset version on load
             if st.session_state.df is not None:
                 st.success(f"Loaded {len(st.session_state.df)} orders")
     
@@ -338,7 +346,6 @@ with st.sidebar:
                     'Type': 'Placeholder'
                 }
                 st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])], ignore_index=True)
-                st.session_state.data_version += 1
                 st.success("Placeholder added!")
                 st.rerun()
     
@@ -417,14 +424,6 @@ if st.session_state.df is not None:
             custom_css="""
                 .fc {
                     background-color: white;
-                    color: #31333F; 
-                }
-                .fc-toolbar-title {
-                    color: #31333F !important;
-                }
-                .fc-button-primary {
-                    background-color: #007bff !important;
-                    border-color: #007bff !important;
                 }
                 .fc-event {
                     font-size: 11px;
@@ -449,8 +448,10 @@ if st.session_state.df is not None:
                 }
                 .fc-col-header-cell {
                     background-color: #f8f9fa;
-                    color: #333;
                     font-weight: bold;
+                }
+                .fc-scrollgrid {
+                    border: 1px solid #dee2e6;
                 }
             """
         )
@@ -459,18 +460,45 @@ if st.session_state.df is not None:
         if calendar_result.get("eventDrop"):
             dropped_event = calendar_result["eventDrop"]
             event_id = int(dropped_event["event"]["id"])
+            new_date = pd.Timestamp(dropped_event["event"]["start"])
             
-            # --- CHANGE 2: Ensure strictly Pandas Timestamp ---
-            new_date = pd.to_datetime(dropped_event["event"]["start"])
+            # Store pending change instead of immediate update
+            change_info = {
+                'event_id': event_id,
+                'new_date': new_date,
+                'wo': st.session_state.df.loc[event_id, 'WO']
+            }
             
-            # Update the dataframe
-            st.session_state.df.loc[event_id, 'Scheduled Date'] = new_date
+            # Check if this event already has a pending change and update it
+            existing_change = next((i for i, c in enumerate(st.session_state.pending_calendar_changes) 
+                                   if c['event_id'] == event_id), None)
+            if existing_change is not None:
+                st.session_state.pending_calendar_changes[existing_change] = change_info
+            else:
+                st.session_state.pending_calendar_changes.append(change_info)
             
-            # Increment version to force table update
-            st.session_state.data_version += 1
+            st.warning(f"📌 Pending: {st.session_state.df.loc[event_id, 'WO']} → {new_date.strftime('%Y-%m-%d')} (Click 'Update Schedule' to apply)")
+        
+        # Update Schedule button below calendar
+        if st.session_state.pending_calendar_changes:
+            st.markdown("### 📝 Pending Changes")
+            for change in st.session_state.pending_calendar_changes:
+                st.write(f"- **{change['wo']}** → {change['new_date'].strftime('%Y-%m-%d')}")
             
-            st.success(f"✅ Moved {st.session_state.df.loc[event_id, 'WO']} to {new_date.strftime('%Y-%m-%d')}")
-            st.rerun()
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if st.button("✅ Update Schedule", type="primary", key="update_calendar"):
+                    # Apply all pending changes
+                    for change in st.session_state.pending_calendar_changes:
+                        st.session_state.df.loc[change['event_id'], 'Scheduled Date'] = change['new_date']
+                    
+                    st.success(f"✅ Updated {len(st.session_state.pending_calendar_changes)} job(s) successfully!")
+                    st.session_state.pending_calendar_changes = []
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel Changes", key="cancel_calendar"):
+                    st.session_state.pending_calendar_changes = []
+                    st.rerun()
         
         # Show event details on click
         if calendar_result.get("eventClick"):
@@ -516,30 +544,49 @@ if st.session_state.df is not None:
             filtered_df = filtered_df[filtered_df['Customer Name'].str.contains(customer_search, case=False, na=False)]
         
         # Display editable dataframe
-        st.info("💡 Click cells to edit. Changes are made in memory - remember to save!")
+        st.info("💡 Click cells to edit or add new rows. Click 'Update Schedule' to apply changes!")
         
-        # --- CHANGE 2: USE KEY FOR DATA LINKAGE ---
-        # We add the key=f"editor_{st.session_state.data_version}"
-        # This forces the editor to re-load from source when the Calendar (or anything else) changes the data_version.
         edited_df = st.data_editor(
             filtered_df[['WO', 'Quote', 'PO Number', 'Status', 'Customer Name', 
                         'Model Description', 'Scheduled Date', 'Actual Delivery Date', 'Price']],
             use_container_width=True,
             num_rows="dynamic",
-            key=f"editor_{st.session_state.data_version}", 
             column_config={
                 "Scheduled Date": st.column_config.DateColumn("Scheduled Date", format="YYYY-MM-DD"),
                 "Actual Delivery Date": st.column_config.DateColumn("Actual Delivery Date", format="YYYY-MM-DD"),
                 "Price": st.column_config.NumberColumn("Price", format="$%.2f")
-            }
+            },
+            key="order_book_editor"
         )
         
-        # Update session state with edits
-        if not edited_df.equals(filtered_df[edited_df.columns]):
-            for col in edited_df.columns:
-                st.session_state.df.loc[filtered_df.index, col] = edited_df[col].values
-            # We don't increment data_version here to avoid losing focus while typing in the table
-            st.rerun()
+        # Check if there are changes
+        changes_detected = not edited_df.equals(filtered_df[edited_df.columns])
+        
+        # Update Schedule button for table
+        if changes_detected or st.session_state.pending_table_changes:
+            st.markdown("---")
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if st.button("✅ Update Schedule", type="primary", key="update_table"):
+                    # Update session state with edits
+                    for col in edited_df.columns:
+                        st.session_state.df.loc[filtered_df.index, col] = edited_df[col].values
+                    
+                    # Update color column based on status
+                    if 'Status' in st.session_state.df.columns:
+                        st.session_state.df['Color'] = st.session_state.df['Status'].map(STATUS_COLORS).fillna(STATUS_COLORS['Unscheduled'])
+                    
+                    st.session_state.pending_table_changes = False
+                    st.success("✅ Schedule updated successfully!")
+                    st.rerun()
+            with col2:
+                if st.button("❌ Cancel Changes", key="cancel_table"):
+                    st.session_state.pending_table_changes = False
+                    st.rerun()
+        
+        # Mark that there are pending changes
+        if changes_detected:
+            st.session_state.pending_table_changes = True
 
 else:
     # Welcome screen
