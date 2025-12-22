@@ -1,214 +1,566 @@
 import streamlit as st
-from streamlit_calendar import calendar
 import pandas as pd
-import datetime
-import os
+from datetime import datetime, timedelta
+from streamlit_calendar import calendar
+import json
 
-# --- 1. CONFIGURATION & SETUP ---
-st.set_page_config(layout="wide", page_title="Production Scheduler")
+# Page configuration with light theme
+st.set_page_config(
+    page_title="Production Scheduler", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
-FILE_PATH = "ORDER BOOK TRACKER.csv"
+# --- CHANGE 1: IMPROVED CSS FOR VISIBILITY ---
+# Added specific styling for text, headers, and metrics to ensure they appear dark on the white background.
+st.markdown("""
+    <style>
+    .main {
+        background-color: #ffffff;
+    }
+    .stApp {
+        background-color: #ffffff;
+    }
+    /* Force text colors to dark grey/black for visibility */
+    h1, h2, h3, h4, h5, h6, p, span, li, div {
+        color: #31333F !important;
+    }
+    /* Specific styling for Metrics to ensure they are visible */
+    [data-testid="stMetricValue"] {
+        color: #31333F !important;
+    }
+    [data-testid="stMetricLabel"] {
+        color: #555555 !important;
+    }
+    /* Fix table text color */
+    div[data-testid="stDataFrame"] {
+        color: #31333F !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- 2. HELPER FUNCTIONS ---
+# Initialize session state
+if 'df' not in st.session_state:
+    st.session_state.df = None
+if 'last_saved' not in st.session_state:
+    st.session_state.last_saved = None
+# --- CHANGE 2: DATA VERSION CONTROL ---
+# This counter helps force the table to refresh when the calendar updates the data
+if 'data_version' not in st.session_state:
+    st.session_state.data_version = 0
 
-@st.cache_data(ttl=60)
-def load_data_from_csv():
-    """Loads and cleans the initial data from CSV."""
-    if os.path.exists(FILE_PATH):
-        df = pd.read_csv(FILE_PATH)
-        # Clean column names (remove leading/trailing spaces)
+# Color mapping for statuses
+STATUS_COLORS = {
+    'Completed': '#28a745',  # Green
+    'In Progress': '#007bff',  # Blue
+    'Scheduled': '#ffc107',  # Yellow
+    'Placeholder': '#fd7e14',  # Orange
+    'Unscheduled': '#6c757d'  # Grey
+}
+
+def load_data(uploaded_file):
+    """Load and clean the CSV data"""
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Clean and standardize column names
         df.columns = df.columns.str.strip()
         
-        # Ensure 'Scheduled Date' is strictly datetime (NaT for errors/empty)
-        df['Scheduled Date'] = pd.to_datetime(df['Scheduled Date'], errors='coerce')
+        # Convert date columns
+        date_columns = ['Scheduled Date', 'Actual Delivery Date']
+        for col in date_columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
         
-        # Ensure 'WO' is string to avoid ID conflicts
-        df['WO'] = df['WO'].astype(str)
+        # Add color column based on status
+        if 'Status' in df.columns:
+            df['Color'] = df['Status'].map(STATUS_COLORS).fillna(STATUS_COLORS['Unscheduled'])
+        else:
+            df['Color'] = STATUS_COLORS['Scheduled']
+        
+        # Add type column (Job vs Placeholder)
+        if 'Type' not in df.columns:
+            df['Type'] = 'Job'
+        
         return df
-    else:
-        st.error(f"File {FILE_PATH} not found. Please ensure it is in the app directory.")
-        return pd.DataFrame(columns=['WO', 'Customer Name', 'Scheduled Date', 'Status', 'Model Description'])
-
-def save_data_to_csv(df):
-    """Saves the current session state dataframe back to CSV."""
-    df_to_save = df.copy()
-    # Format dates as YYYY-MM-DD for the CSV file
-    df_to_save['Scheduled Date'] = df_to_save['Scheduled Date'].dt.strftime('%Y-%m-%d')
-    try:
-        df_to_save.to_csv(FILE_PATH, index=False)
-        st.toast("✅ Schedule saved to ORDER BOOK TRACKER.csv", icon="💾")
     except Exception as e:
-        st.error(f"Error saving file: {e}")
+        st.error(f"Error loading data: {str(e)}")
+        return None
 
-def get_event_color(status):
-    """Returns color code based on Status."""
-    status = str(status).lower()
-    if 'placeholder' in status:
-        return 'orange'
-    elif status == 'completed':
-        return 'green'
-    elif status == 'in progress':
-        return '#FFC107' # Amber/Yellow
-    elif status == 'open':
-        return '#3788d8' # Standard Blue
-    elif status == 'flag':
-        return 'red'
-    return 'gray' # Default for others
-
-# --- 3. SESSION STATE INITIALIZATION ---
-# We load data into session_state so we can manipulate it in memory before saving.
-if 'df' not in st.session_state:
-    st.session_state.df = load_data_from_csv()
-
-# --- 4. SIDEBAR ACTIONS ---
-with st.sidebar:
-    st.header("🏭 Scheduler Controls")
+def df_to_calendar_events(df):
+    """Convert dataframe to FullCalendar event format with detailed titles"""
+    events = []
     
-    # Action 2: Add Placeholder
-    with st.expander("Add Placeholder", expanded=True):
-        ph_title = st.text_input("Customer/Title", placeholder="e.g. Tentative - Mond")
-        ph_date = st.date_input("Target Date", value=datetime.date.today())
+    for idx, row in df.iterrows():
+        # Skip rows without scheduled dates
+        if pd.isna(row.get('Scheduled Date')):
+            continue
         
-        if st.button("Add Slot"):
-            if ph_title:
-                new_wo_id = f"PH-{len(st.session_state.df) + 100}" # Generate Temp ID
-                new_row = {
-                    'WO': new_wo_id,
-                    'Customer Name': ph_title,
-                    'Scheduled Date': pd.to_datetime(ph_date),
-                    'Status': 'Placeholder',
-                    'Model Description': 'Manual Placeholder Entry'
-                }
-                # Add to session state
-                st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])], ignore_index=True)
-                st.success(f"Added {ph_title} on {ph_date}")
-                st.rerun()
+        # Create detailed event title with line breaks
+        wo = str(row.get('WO', 'N/A'))
+        customer = str(row.get('Customer Name', 'N/A'))
+        model = str(row.get('Model Description', 'N/A'))
+        
+        # Truncate long descriptions for better display
+        if len(model) > 40:
+            model = model[:37] + "..."
+        if len(customer) > 30:
+            customer = customer[:27] + "..."
+        
+        title = f"{wo}\n{customer}\n{model}"
+        
+        # Create event object
+        event = {
+            'title': title,
+            'start': row['Scheduled Date'].strftime('%Y-%m-%d'),
+            'id': str(idx),  # Use index as unique ID
+            'backgroundColor': row.get('Color', STATUS_COLORS['Scheduled']),
+            'borderColor': row.get('Color', STATUS_COLORS['Scheduled']),
+            'extendedProps': {
+                'wo': wo,
+                'customer': customer,
+                'model': str(row.get('Model Description', '')),
+                'price': str(row.get('Price', '')),
+                'status': str(row.get('Status', ''))
+            }
+        }
+        events.append(event)
+    
+    return events
 
+def save_data(df, filename="ORDER_BOOK_TRACKER_UPDATED.csv"):
+    """Save dataframe back to CSV"""
+    try:
+        # Remove Color column before saving (it's computed)
+        df_to_save = df.drop(columns=['Color'], errors='ignore')
+        df_to_save.to_csv(filename, index=False)
+        st.session_state.last_saved = datetime.now()
+        return True
+    except Exception as e:
+        st.error(f"Error saving data: {str(e)}")
+        return False
+
+def generate_pdf_schedule(df, year, month):
+    """Generate HTML for PDF printing of monthly schedule"""
+    # Filter data for the selected month
+    df_month = df[
+        (df['Scheduled Date'].dt.year == year) & 
+        (df['Scheduled Date'].dt.month == month) &
+        (df['Scheduled Date'].notna())
+    ].copy()
+    
+    # Sort by date
+    df_month = df_month.sort_values('Scheduled Date')
+    
+    # Generate HTML
+    month_name = datetime(year, month, 1).strftime('%B %Y')
+    
+    html = f"""
+    <html>
+    <head>
+        <title>Production Schedule - {month_name}</title>
+        <style>
+            @media print {{
+                body {{ margin: 0; }}
+            }}
+            body {{
+                font-family: Arial, sans-serif;
+                padding: 20px;
+                background: white;
+                color: black;
+            }}
+            h1 {{
+                color: #333;
+                text-align: center;
+                border-bottom: 3px solid #007bff;
+                padding-bottom: 10px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 20px;
+            }}
+            th {{
+                background-color: #007bff;
+                color: white;
+                padding: 12px;
+                text-align: left;
+                font-weight: bold;
+            }}
+            td {{
+                padding: 10px;
+                border-bottom: 1px solid #ddd;
+                color: black;
+            }}
+            tr:nth-child(even) {{
+                background-color: #f8f9fa;
+            }}
+            tr:hover {{
+                background-color: #e9ecef;
+            }}
+            .status-badge {{
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            .completed {{ background-color: #28a745; color: white; }}
+            .scheduled {{ background-color: #ffc107; color: black; }}
+            .placeholder {{ background-color: #fd7e14; color: white; }}
+            .footer {{
+                margin-top: 30px;
+                text-align: center;
+                color: #666;
+                font-size: 12px;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>Production Schedule - {month_name}</h1>
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>WO #</th>
+                    <th>Customer</th>
+                    <th>Model Description</th>
+                    <th>Status</th>
+                    <th>Price</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    
+    for _, row in df_month.iterrows():
+        date_str = row['Scheduled Date'].strftime('%Y-%m-%d')
+        status = row.get('Status', 'Scheduled')
+        status_class = status.lower().replace(' ', '-')
+        
+        html += f"""
+                <tr>
+                    <td><strong>{date_str}</strong></td>
+                    <td>{row.get('WO', 'N/A')}</td>
+                    <td>{row.get('Customer Name', 'N/A')}</td>
+                    <td>{row.get('Model Description', 'N/A')}</td>
+                    <td><span class="status-badge {status_class}">{status}</span></td>
+                    <td>{row.get('Price', 'N/A')}</td>
+                </tr>
+        """
+    
+    html += f"""
+            </tbody>
+        </table>
+        <div class="footer">
+            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Total Jobs: {len(df_month)}</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+# Main UI
+st.title("🏭 Production Scheduler")
+st.markdown("---")
+
+# Sidebar
+with st.sidebar:
+    st.header("📁 Data Management")
+    
+    # File uploader
+    uploaded_file = st.file_uploader("Upload Order Book CSV", type=['csv'])
+    
+    if uploaded_file is not None:
+        if st.button("Load Data", type="primary"):
+            st.session_state.df = load_data(uploaded_file)
+            st.session_state.data_version += 1 # Reset version on load
+            if st.session_state.df is not None:
+                st.success(f"Loaded {len(st.session_state.df)} orders")
+    
     st.markdown("---")
     
-    # Action C: Save & Close
-    st.write("### Data Persistence")
-    if st.button("💾 Save Changes to CSV", type="primary"):
-        save_data_to_csv(st.session_state.df)
-
-# --- 5. MAIN LAYOUT ---
-col_calendar, col_list = st.columns([0.65, 0.35], gap="large")
-
-# --- CALENDAR COMPONENT ---
-with col_calendar:
-    st.subheader("📅 Master Calendar")
-    
-    # Transform Dataframe to Calendar Events JSON
-    events = []
-    for idx, row in st.session_state.df.iterrows():
-        if pd.notna(row['Scheduled Date']):
-            events.append({
-                "id": row['WO'],
-                "title": f"{row['Customer Name']} ({row['WO']})",
-                "start": row['Scheduled Date'].strftime('%Y-%m-%d'),
-                "backgroundColor": get_event_color(row.get('Status', '')),
-                "borderColor": get_event_color(row.get('Status', '')),
-                # Extended props for tooltip or future use
-                "extendedProps": {
-                    "description": str(row.get('Model Description', '')),
-                    "status": str(row.get('Status', ''))
-                }
-            })
-
-    calendar_options = {
-        "editable": True, # Enables Drag & Drop
-        "navLinks": True,
-        "headerToolbar": {
-            "left": "today prev,next",
-            "center": "title",
-            "right": "dayGridMonth,timeGridWeek"
-        },
-        "initialView": "dayGridMonth",
-    }
-    
-    # Render Calendar
-    calendar_state = calendar(events=events, options=calendar_options, key="scheduler_cal")
-    
-    # Logic: Listen for Drag & Drop (eventChange)
-    if calendar_state.get("eventChange"):
-        change_info = calendar_state["eventChange"]
-        event_data = change_info["event"]
-        wo_id = event_data["id"]
-        new_start = event_data["start"] # format usually YYYY-MM-DD for dayGrid
+    # PDF Export functionality
+    if st.session_state.df is not None:
+        st.header("📄 Export to PDF")
         
-        # Update Session State
-        try:
-            # Locate row by WO
-            mask = st.session_state.df['WO'] == wo_id
-            if mask.any():
-                new_date_obj = pd.to_datetime(new_start)
-                st.session_state.df.loc[mask, 'Scheduled Date'] = new_date_obj
-                st.toast(f"Moved WO #{wo_id} to {new_start}")
-                # We need to rerun to refresh the Table view immediately
-                st.rerun()
-        except Exception as e:
-            st.error(f"Failed to update date: {e}")
-
-# --- ORDER BOOK TABLE ---
-with col_list:
-    st.subheader("📋 Order Book")
+        current_date = datetime.now()
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            export_month = st.selectbox(
+                "Month",
+                range(1, 13),
+                index=current_date.month - 1,
+                format_func=lambda x: datetime(2000, x, 1).strftime('%B')
+            )
+        
+        with col2:
+            export_year = st.selectbox(
+                "Year",
+                range(current_date.year - 1, current_date.year + 3),
+                index=1
+            )
+        
+        if st.button("Generate PDF View", type="primary"):
+            html_content = generate_pdf_schedule(st.session_state.df, export_year, export_month)
+            st.download_button(
+                label="📥 Download PDF (HTML)",
+                data=html_content,
+                file_name=f"schedule_{export_year}_{export_month:02d}.html",
+                mime="text/html"
+            )
+            st.info("💡 Open the downloaded HTML file and use your browser's Print to PDF feature (Ctrl+P / Cmd+P)")
+        
+        st.markdown("---")
     
-    # Action 3: Handling Unscheduled Jobs
-    filter_mode = st.radio("Show:", ["All Jobs", "Scheduled", "Unscheduled"], horizontal=True)
-    
-    # Filter Data for View
-    df_view = st.session_state.df.copy()
-    if filter_mode == "Scheduled":
-        df_view = df_view[df_view['Scheduled Date'].notna()]
-    elif filter_mode == "Unscheduled":
-        df_view = df_view[df_view['Scheduled Date'].isna()]
-    
-    # We display a subset of columns for clarity
-    cols_to_show = ['WO', 'Customer Name', 'Scheduled Date', 'Status']
-    
-    # Use Data Editor to allow manual changes in the list
-    edited_df = st.data_editor(
-        df_view[cols_to_show],
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Scheduled Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-            "WO": st.column_config.TextColumn("WO", disabled=True) # Lock IDs
-        },
-        key="data_editor"
-    )
-    
-    # Two-Way Sync Logic: Table -> Session State
-    # If the user edits the table, we must update the main dataframe
-    # We check if 'edited_df' differs from the current view in session state
-    # (Simplified check: we iterate and update based on WO key)
-    
-    if st.session_state.get("data_editor"):
-        # This block triggers if edits were made
-        # We assume WO is unique. We update the main df based on the edits.
-        # Iterate through edited rows (Streamlit returns the full edited dataframe)
-        for index, row in edited_df.iterrows():
-            wo_key = row['WO']
-            new_date = row['Scheduled Date']
+    # Add Placeholder functionality
+    if st.session_state.df is not None:
+        st.header("➕ Add Placeholder")
+        
+        with st.form("add_placeholder"):
+            placeholder_name = st.text_input("Description", "Tentative - Customer")
+            placeholder_date = st.date_input("Date")
+            submit_placeholder = st.form_submit_button("Add Placeholder")
             
-            # Find in master DF
-            master_idx = st.session_state.df[st.session_state.df['WO'] == wo_key].index
-            if not master_idx.empty:
-                current_val = st.session_state.df.at[master_idx[0], 'Scheduled Date']
-                
-                # Check if date changed (handle NaT/None comparison)
-                val_changed = False
-                if pd.isna(current_val) and pd.notna(new_date):
-                    val_changed = True
-                elif pd.notna(current_val) and pd.isna(new_date):
-                    val_changed = True
-                elif pd.notna(current_val) and pd.notna(new_date):
-                     # Convert both to timestamps for comparison if needed, or compare logic
-                     if pd.to_datetime(current_val).date() != pd.to_datetime(new_date):
-                         val_changed = True
+            if submit_placeholder:
+                new_row = {
+                    'WO': f'PLACEHOLDER-{len(st.session_state.df)+1}',
+                    'Quote': '',
+                    'PO Number': '',
+                    'Status': 'Placeholder',
+                    'Customer Name': placeholder_name,
+                    'Model Description': 'Placeholder',
+                    'Scheduled Date': pd.Timestamp(placeholder_date),
+                    'Actual Delivery Date': pd.NaT,
+                    'Price': '',
+                    'Color': STATUS_COLORS['Placeholder'],
+                    'Type': 'Placeholder'
+                }
+                st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])], ignore_index=True)
+                st.session_state.data_version += 1
+                st.success("Placeholder added!")
+                st.rerun()
+    
+    st.markdown("---")
+    
+    # Save functionality
+    if st.session_state.df is not None:
+        st.header("💾 Save Changes")
+        
+        if st.button("Save to CSV", type="primary"):
+            if save_data(st.session_state.df):
+                st.success("✅ Data saved successfully!")
+                st.download_button(
+                    label="Download Updated CSV",
+                    data=st.session_state.df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"order_book_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime='text/csv'
+                )
+        
+        if st.session_state.last_saved:
+            st.info(f"Last saved: {st.session_state.last_saved.strftime('%I:%M %p')}")
 
-                if val_changed:
-                    st.session_state.df.at[master_idx[0], 'Scheduled Date'] = pd.to_datetime(new_date)
-                    st.toast(f"Updated {wo_key} from Table")
-                    # Force rerun to sync Calendar
-                    st.rerun()
+# Main content area
+if st.session_state.df is not None:
+    
+    # Metrics row
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_orders = len(st.session_state.df[st.session_state.df['Type'] == 'Job'])
+        st.metric("Total Orders", total_orders)
+    
+    with col2:
+        scheduled = len(st.session_state.df[st.session_state.df['Scheduled Date'].notna()])
+        st.metric("Scheduled", scheduled)
+    
+    with col3:
+        unscheduled = len(st.session_state.df[st.session_state.df['Scheduled Date'].isna()])
+        st.metric("Unscheduled", unscheduled)
+    
+    with col4:
+        completed = len(st.session_state.df[st.session_state.df['Status'] == 'Completed'])
+        st.metric("Completed", completed)
+    
+    st.markdown("---")
+    
+    # Create tabs for Calendar and Table views
+    tab1, tab2 = st.tabs(["📅 Calendar View", "📋 Order Book Table"])
+    
+    with tab1:
+        st.subheader("Production Calendar")
+        
+        # Calendar configuration with larger display
+        calendar_options = {
+            "editable": True,
+            "selectable": True,
+            "headerToolbar": {
+                "left": "prev,next today",
+                "center": "title",
+                "right": "dayGridMonth,timeGridWeek,timeGridDay"
+            },
+            "initialView": "dayGridMonth",
+            "height": 800,
+            "eventDisplay": "block",
+            "displayEventTime": False,
+            "eventColor": "#007bff",
+        }
+        
+        # Convert dataframe to events
+        events = df_to_calendar_events(st.session_state.df)
+        
+        # Display calendar with enhanced styling
+        calendar_result = calendar(
+            events=events,
+            options=calendar_options,
+            custom_css="""
+                .fc {
+                    background-color: white;
+                    color: #31333F; 
+                }
+                .fc-toolbar-title {
+                    color: #31333F !important;
+                }
+                .fc-button-primary {
+                    background-color: #007bff !important;
+                    border-color: #007bff !important;
+                }
+                .fc-event {
+                    font-size: 11px;
+                    cursor: move;
+                    padding: 4px;
+                    margin: 2px 0;
+                    border-radius: 4px;
+                    white-space: pre-line;
+                    line-height: 1.3;
+                    min-height: 60px;
+                }
+                .fc-daygrid-day {
+                    background-color: #ffffff;
+                }
+                .fc-day-today {
+                    background-color: #fff3cd !important;
+                }
+                .fc-daygrid-day-number {
+                    color: #333;
+                    font-weight: bold;
+                    font-size: 14px;
+                }
+                .fc-col-header-cell {
+                    background-color: #f8f9fa;
+                    color: #333;
+                    font-weight: bold;
+                }
+            """
+        )
+        
+        # Handle calendar interactions
+        if calendar_result.get("eventDrop"):
+            dropped_event = calendar_result["eventDrop"]
+            event_id = int(dropped_event["event"]["id"])
+            
+            # --- CHANGE 2: Ensure strictly Pandas Timestamp ---
+            new_date = pd.to_datetime(dropped_event["event"]["start"])
+            
+            # Update the dataframe
+            st.session_state.df.loc[event_id, 'Scheduled Date'] = new_date
+            
+            # Increment version to force table update
+            st.session_state.data_version += 1
+            
+            st.success(f"✅ Moved {st.session_state.df.loc[event_id, 'WO']} to {new_date.strftime('%Y-%m-%d')}")
+            st.rerun()
+        
+        # Show event details on click
+        if calendar_result.get("eventClick"):
+            clicked_event = calendar_result["eventClick"]["event"]
+            event_id = int(clicked_event["id"])
+            row = st.session_state.df.loc[event_id]
+            
+            st.info(f"""
+            **WO:** {row['WO']}  
+            **Customer:** {row['Customer Name']}  
+            **Model:** {row['Model Description']}  
+            **Status:** {row['Status']}  
+            **Scheduled:** {row['Scheduled Date'].strftime('%Y-%m-%d') if pd.notna(row['Scheduled Date']) else 'N/A'}  
+            **Price:** {row['Price']}
+            """)
+    
+    with tab2:
+        st.subheader("Order Book Table")
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            status_filter = st.multiselect(
+                "Filter by Status",
+                options=st.session_state.df['Status'].unique(),
+                default=st.session_state.df['Status'].unique()
+            )
+        
+        with col2:
+            show_unscheduled = st.checkbox("Show Only Unscheduled", False)
+        
+        with col3:
+            customer_search = st.text_input("Search Customer")
+        
+        # Apply filters
+        filtered_df = st.session_state.df[st.session_state.df['Status'].isin(status_filter)]
+        
+        if show_unscheduled:
+            filtered_df = filtered_df[filtered_df['Scheduled Date'].isna()]
+        
+        if customer_search:
+            filtered_df = filtered_df[filtered_df['Customer Name'].str.contains(customer_search, case=False, na=False)]
+        
+        # Display editable dataframe
+        st.info("💡 Click cells to edit. Changes are made in memory - remember to save!")
+        
+        # --- CHANGE 2: USE KEY FOR DATA LINKAGE ---
+        # We add the key=f"editor_{st.session_state.data_version}"
+        # This forces the editor to re-load from source when the Calendar (or anything else) changes the data_version.
+        edited_df = st.data_editor(
+            filtered_df[['WO', 'Quote', 'PO Number', 'Status', 'Customer Name', 
+                        'Model Description', 'Scheduled Date', 'Actual Delivery Date', 'Price']],
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"editor_{st.session_state.data_version}", 
+            column_config={
+                "Scheduled Date": st.column_config.DateColumn("Scheduled Date", format="YYYY-MM-DD"),
+                "Actual Delivery Date": st.column_config.DateColumn("Actual Delivery Date", format="YYYY-MM-DD"),
+                "Price": st.column_config.NumberColumn("Price", format="$%.2f")
+            }
+        )
+        
+        # Update session state with edits
+        if not edited_df.equals(filtered_df[edited_df.columns]):
+            for col in edited_df.columns:
+                st.session_state.df.loc[filtered_df.index, col] = edited_df[col].values
+            # We don't increment data_version here to avoid losing focus while typing in the table
+            st.rerun()
+
+else:
+    # Welcome screen
+    st.info("👈 Please upload your Order Book CSV file using the sidebar to get started")
+    
+    st.markdown("""
+    ### Features:
+    - 📅 **Interactive Calendar** - Drag and drop jobs to reschedule
+    - 📊 **Order Book Table** - View and edit all orders in one place
+    - ➕ **Add Placeholders** - Reserve dates for tentative orders
+    - 💾 **Save Changes** - Export your updated schedule
+    - 📄 **PDF Export** - Print monthly schedules
+    - 🔍 **Filter & Search** - Find orders quickly
+    - 🎨 **Color Coding** - Visual status indicators
+    
+    ### How to Use:
+    1. Upload your ORDER BOOK TRACKER.csv file
+    2. Click "Load Data" to initialize the scheduler
+    3. Use the Calendar tab to drag jobs to new dates
+    4. Use the Order Book Table to edit details or view unscheduled items
+    5. Add placeholders for tentative bookings
+    6. Export monthly schedules to PDF for printing
+    7. Save your changes when done
+    """)
