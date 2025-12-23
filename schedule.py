@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from streamlit_calendar import calendar
 import json
+import time
 
 # Page configuration
 st.set_page_config(page_title="Production Scheduler", layout="wide", initial_sidebar_state="expanded")
@@ -14,8 +15,8 @@ if 'last_saved' not in st.session_state:
     st.session_state.last_saved = None
 if 'pending_calendar_changes' not in st.session_state:
     st.session_state.pending_calendar_changes = {}
-if 'force_calendar_refresh' not in st.session_state:
-    st.session_state.force_calendar_refresh = False
+if 'calendar_key_counter' not in st.session_state:
+    st.session_state.calendar_key_counter = 0
 
 # Color mapping for statuses
 STATUS_COLORS = {
@@ -119,7 +120,7 @@ with st.sidebar:
         if st.button("Load Data", type="primary"):
             st.session_state.df = load_data(uploaded_file)
             st.session_state.pending_calendar_changes = {}
-            st.session_state.force_calendar_refresh = False
+            st.session_state.calendar_key_counter += 1
             if st.session_state.df is not None:
                 st.success(f"Loaded {len(st.session_state.df)} orders")
     
@@ -150,7 +151,7 @@ with st.sidebar:
                 }
                 st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([new_row])], ignore_index=True)
                 st.session_state.df = st.session_state.df.reset_index(drop=True)
-                st.session_state.force_calendar_refresh = True
+                st.session_state.calendar_key_counter += 1
                 st.success("Placeholder added!")
                 st.rerun()
     
@@ -203,39 +204,46 @@ if st.session_state.df is not None:
     with tab1:
         st.subheader("Production Calendar")
         
-        # Show pending changes notification and buttons at the top
-        if st.session_state.pending_calendar_changes:
-            st.warning(f"⚠️ {len(st.session_state.pending_calendar_changes)} pending change(s)")
-            
-            # Show what's pending
-            with st.expander("View Pending Changes"):
-                for event_id, new_date in st.session_state.pending_calendar_changes.items():
-                    wo = st.session_state.df.loc[event_id, 'WO']
-                    old_date = st.session_state.df.loc[event_id, 'Scheduled Date']
-                    st.write(f"**{wo}**: {old_date.strftime('%Y-%m-%d') if pd.notna(old_date) else 'None'} → {new_date.strftime('%Y-%m-%d')}")
-            
-            # Action buttons
-            col1, col2, col3 = st.columns([1, 1, 4])
-            with col1:
-                if st.button("✅ Update Schedule", type="primary", key="update_calendar_btn"):
-                    # Apply all pending changes
+        # Always show the buttons section at the top
+        button_container = st.container()
+        
+        with button_container:
+            if st.session_state.pending_calendar_changes:
+                st.warning(f"⚠️ {len(st.session_state.pending_calendar_changes)} pending change(s)")
+                
+                # Show what's pending
+                with st.expander("View Pending Changes"):
                     for event_id, new_date in st.session_state.pending_calendar_changes.items():
-                        st.session_state.df.loc[event_id, 'Scheduled Date'] = new_date
-                    
-                    # Update colors in case status changed
-                    st.session_state.df = update_colors(st.session_state.df)
-                    
-                    # Clear pending changes and force refresh
-                    st.session_state.pending_calendar_changes = {}
-                    st.session_state.force_calendar_refresh = True
-                    st.success(f"✅ Schedule updated successfully!")
-                    st.rerun()
-            
-            with col2:
-                if st.button("❌ Cancel", key="cancel_calendar_btn"):
-                    st.session_state.pending_calendar_changes = {}
-                    st.session_state.force_calendar_refresh = True
-                    st.rerun()
+                        if event_id < len(st.session_state.df):
+                            wo = st.session_state.df.loc[event_id, 'WO']
+                            old_date = st.session_state.df.loc[event_id, 'Scheduled Date']
+                            st.write(f"**{wo}**: {old_date.strftime('%Y-%m-%d') if pd.notna(old_date) else 'None'} → {new_date.strftime('%Y-%m-%d')}")
+                
+                # Action buttons
+                col1, col2, col3 = st.columns([1, 1, 4])
+                with col1:
+                    update_btn = st.button("✅ Update Schedule", type="primary", key=f"update_cal_{st.session_state.calendar_key_counter}")
+                    if update_btn:
+                        # Apply all pending changes
+                        for event_id, new_date in st.session_state.pending_calendar_changes.items():
+                            if event_id < len(st.session_state.df):
+                                st.session_state.df.loc[event_id, 'Scheduled Date'] = new_date
+                        
+                        # Update colors in case status changed
+                        st.session_state.df = update_colors(st.session_state.df)
+                        
+                        # Clear pending changes and increment counter
+                        st.session_state.pending_calendar_changes = {}
+                        st.session_state.calendar_key_counter += 1
+                        st.success(f"✅ Schedule updated successfully!")
+                        st.rerun()
+                
+                with col2:
+                    cancel_btn = st.button("❌ Cancel", key=f"cancel_cal_{st.session_state.calendar_key_counter}")
+                    if cancel_btn:
+                        st.session_state.pending_calendar_changes = {}
+                        st.session_state.calendar_key_counter += 1
+                        st.rerun()
         
         st.markdown("---")
         
@@ -255,17 +263,11 @@ if st.session_state.df is not None:
         # Convert dataframe to events
         events = df_to_calendar_events(st.session_state.df)
         
-        # Create unique key for calendar to force refresh when needed
-        calendar_key = f"calendar_{hash(str(st.session_state.df['Scheduled Date'].tolist()))}"
-        if st.session_state.force_calendar_refresh:
-            calendar_key = f"calendar_{datetime.now().timestamp()}"
-            st.session_state.force_calendar_refresh = False
-        
-        # Display calendar
+        # Display calendar with consistent key
         calendar_result = calendar(
             events=events,
             options=calendar_options,
-            key=calendar_key,
+            key=f"production_calendar_{st.session_state.calendar_key_counter}",
             custom_css="""
                 .fc-event-past {
                     opacity: 0.8;
@@ -278,29 +280,37 @@ if st.session_state.df is not None:
         )
         
         # Handle calendar interactions - store in pending changes
-        if calendar_result and calendar_result.get("eventDrop"):
-            dropped_event = calendar_result["eventDrop"]
-            event_id = int(dropped_event["event"]["id"])
-            new_date = pd.Timestamp(dropped_event["event"]["start"])
+        if calendar_result:
+            if calendar_result.get("eventDrop"):
+                dropped_event = calendar_result["eventDrop"]
+                try:
+                    event_id = int(dropped_event["event"]["id"])
+                    new_date = pd.Timestamp(dropped_event["event"]["start"])
+                    
+                    # Store in pending changes (not applied yet)
+                    st.session_state.pending_calendar_changes[event_id] = new_date
+                    st.rerun()
+                except (KeyError, ValueError, IndexError) as e:
+                    st.error(f"Error processing drag event: {e}")
             
-            # Store in pending changes (not applied yet)
-            st.session_state.pending_calendar_changes[event_id] = new_date
-            st.rerun()
-        
-        # Show event details on click
-        if calendar_result and calendar_result.get("eventClick"):
-            clicked_event = calendar_result["eventClick"]["event"]
-            event_id = int(clicked_event["id"])
-            row = st.session_state.df.loc[event_id]
-            
-            st.info(f"""
-            **WO:** {row['WO']}  
-            **Customer:** {row['Customer Name']}  
-            **Model:** {row['Model Description']}  
-            **Status:** {row['Status']}  
-            **Scheduled:** {row['Scheduled Date'].strftime('%Y-%m-%d') if pd.notna(row['Scheduled Date']) else 'N/A'}  
-            **Price:** {row['Price']}
-            """)
+            # Show event details on click
+            if calendar_result.get("eventClick"):
+                try:
+                    clicked_event = calendar_result["eventClick"]["event"]
+                    event_id = int(clicked_event["id"])
+                    if event_id < len(st.session_state.df):
+                        row = st.session_state.df.loc[event_id]
+                        
+                        st.info(f"""
+                        **WO:** {row['WO']}  
+                        **Customer:** {row['Customer Name']}  
+                        **Model:** {row['Model Description']}  
+                        **Status:** {row['Status']}  
+                        **Scheduled:** {row['Scheduled Date'].strftime('%Y-%m-%d') if pd.notna(row['Scheduled Date']) else 'N/A'}  
+                        **Price:** {row['Price']}
+                        """)
+                except (KeyError, ValueError, IndexError) as e:
+                    st.error(f"Error displaying event details: {e}")
     
     with tab2:
         st.subheader("Order Book Table")
@@ -338,7 +348,7 @@ if st.session_state.df is not None:
                         'Model Description', 'Scheduled Date', 'Actual Delivery Date', 'Price', 'Type']],
             use_container_width=True,
             num_rows="dynamic",
-            key="order_table_editor",
+            key=f"order_table_{st.session_state.calendar_key_counter}",
             column_config={
                 "Scheduled Date": st.column_config.DateColumn("Scheduled Date", format="YYYY-MM-DD"),
                 "Actual Delivery Date": st.column_config.DateColumn("Actual Delivery Date", format="YYYY-MM-DD"),
@@ -361,7 +371,7 @@ if st.session_state.df is not None:
         # Update button for table
         col1, col2 = st.columns([1, 5])
         with col1:
-            if st.button("✅ Update Schedule", type="primary", key="update_table_btn"):
+            if st.button("✅ Update Schedule", type="primary", key=f"update_table_{st.session_state.calendar_key_counter}"):
                 # Check if there are actual changes
                 has_changes = False
                 
@@ -401,8 +411,8 @@ if st.session_state.df is not None:
                     # Update colors based on new status
                     st.session_state.df = update_colors(st.session_state.df)
                     
-                    # Force calendar refresh
-                    st.session_state.force_calendar_refresh = True
+                    # Increment counter to refresh calendar
+                    st.session_state.calendar_key_counter += 1
                     
                     st.success("✅ Schedule updated! Switch to Calendar tab to see changes.")
                     st.rerun()
